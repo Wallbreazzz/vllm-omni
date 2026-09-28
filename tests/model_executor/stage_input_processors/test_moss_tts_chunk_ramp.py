@@ -5,6 +5,9 @@
 Tests the Moss-TTS stage input processor's chunk-size mode selection:
   1. Static ramp (codec_chunk_ramp configured)
   2. Backward compat (not configured -> original IC/steady behavior)
+and the codec-side warmup frame-size derivation, which must share the
+processor's parse_chunk_ramp semantics (null / invalid / single-entry
+values disable the ramp on both sides instead of raising at codec init).
 
 Framework utilities (parse_chunk_ramp, ramp_chunk_size) are already tested in
 test_qwen3_tts_async_chunk.py -- this file only tests Moss-TTS adapter wiring.
@@ -18,6 +21,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import (
+    _resolve_streaming_graph_frame_sizes,
+)
 from vllm_omni.model_executor.stage_input_processors.moss_tts import (
     talker2codec_raw_async_chunk,
 )
@@ -173,3 +179,31 @@ class TestBackwardCompat:
         tm = _tm(chunk_ramp=None, initial_chunk_frames=1)
         rid = "empty"
         assert _feed(tm, rid, 0) is None
+
+
+class TestGraphFrameSizes:
+    """Codec warmup frame-size derivation shares parse_chunk_ramp semantics:
+    null / invalid / single-entry values disable the ramp (no raise at init)."""
+
+    def _resolve(self, extra):
+        return _resolve_streaming_graph_frame_sizes(1, 15, extra)
+
+    def test_absent_key(self):
+        assert self._resolve({}) == [1, 15]
+        assert self._resolve(None) == [1, 15]
+
+    def test_explicit_null_disables(self):
+        # YAML `codec_chunk_ramp:` (present key, null value) must not raise
+        assert self._resolve({"codec_chunk_ramp": None}) == [1, 15]
+
+    def test_invalid_values_disable(self):
+        assert self._resolve({"codec_chunk_ramp": "2,x,8"}) == [1, 15]
+        assert self._resolve({"codec_chunk_ramp": [4]}) == [1, 15]
+        assert self._resolve({"codec_chunk_ramp": [0, 4, 15]}) == [1, 15]
+        assert self._resolve({"codec_chunk_ramp": 5}) == [1, 15]
+
+    def test_valid_ladder(self):
+        assert self._resolve({"codec_chunk_ramp": [2, 4, 8, 15]}) == [1, 2, 4, 8, 15]
+
+    def test_string_form(self):
+        assert self._resolve({"codec_chunk_ramp": "2, 4, 8, 15"}) == [1, 2, 4, 8, 15]
