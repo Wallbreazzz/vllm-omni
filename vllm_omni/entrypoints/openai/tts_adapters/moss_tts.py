@@ -294,7 +294,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         this process. When the stage pins no devices the stage worker and the
         encoder both default to the first visible device. CUDA and ROCm retain
         family-wide placement; NPU placement is enabled for Local only.
-        Unavailable or unparseable stage devices fall back to CPU.
+        Unavailable or unparsable stage devices fall back to CPU.
         """
         import torch  # local to avoid pulling torch at module import time
 
