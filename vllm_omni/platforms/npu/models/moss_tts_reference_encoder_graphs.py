@@ -128,7 +128,7 @@ class MossNPUReferenceEncoderGraphs(MossReferenceEncoderGraphs):
         audio, lengths = self._buffers[(batch, samples)]
         audio.zero_()
         true_lengths = [wav.shape[-1] for wav in wavs] + [samples] * (batch - len(wavs))
-        lengths.copy_(torch.tensor(true_lengths, dtype=torch.long))
+        lengths.copy_(torch.tensor(true_lengths, dtype=torch.long, device=audio.device))
         for row, wav in enumerate(wavs):
             audio[row, :, : wav.shape[-1]].copy_(wav)
         codes, code_lengths = self._run((audio, lengths), (batch, samples))
