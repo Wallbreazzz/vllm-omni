@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from vllm_omni.model_executor.models.moss_tts.reference_encoder_graphs import MossReferenceEncoderGraphs, _Graph
 from vllm_omni.platforms.npu.models import moss_tts_reference_encoder_graphs as backend
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
@@ -239,3 +240,66 @@ def test_reference_aclgraph_unsupported_runtime_does_not_capture(graph_runtime, 
     graphs.capture()
     assert graphs.captured == [] and graphs.stats["captures"] == 0
     assert graphs.encode([torch.ones(2, 10)]) == [None]
+
+
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+def test_reference_aclgraph_shared_wrapper_selection_and_replay(graph_runtime, platform):
+    """Exercise the common selector through both backend replay implementations."""
+    tokenizer = _Tokenizer()
+    calls = []
+    if platform == "npu":
+        graphs = backend.MossNPUReferenceEncoderGraphs(tokenizer, n_vq=N_VQ)
+        graphs.capture()
+        original = graphs._runner.run
+
+        def run(operation, inputs, shape, compute):
+            calls.append(shape)
+            return original(operation, inputs, shape, compute)
+
+        graphs._runner.run = run
+    else:
+        graphs = MossReferenceEncoderGraphs(
+            tokenizer, n_vq=N_VQ, batch_sizes=(1, 2), bucket_seconds=(4, 8), max_batch_seconds=8
+        )
+
+        class Replay:
+            def __init__(self, audio, lengths, codes, code_lengths, shape):
+                self.audio, self.lengths = audio, lengths
+                self.codes, self.code_lengths, self.shape = codes, code_lengths, shape
+
+            def replay(self):
+                calls.append(self.shape)
+                codes, lengths = graphs._core(self.audio, self.lengths)
+                self.codes.copy_(codes)
+                self.code_lengths.copy_(lengths)
+
+        # Real CPU buffers simulate CUDA capture outputs; no CUDA device is required.
+        for batch, samples in [(1, 256), (1, 512), (2, 256)]:
+            audio = torch.zeros(batch, 2, samples)
+            lengths = torch.full((batch,), samples, dtype=torch.long)
+            codes, code_lengths = graphs._core(audio, lengths)
+            replay = Replay(audio, lengths, codes, code_lengths, (batch, samples))
+            graphs._graphs[(batch, samples)] = _Graph(replay, audio, lengths, codes, code_lengths)
+
+    wavs = [torch.full((2, length), float(i + 1)) for i, length in enumerate([17, 300, 8, 255, 700, 48])]
+    results = graphs.encode(wavs)
+    assert calls == [(1, 512), (2, 256), (2, 256)]
+    for index, (result, wav) in enumerate(zip(results, wavs)):
+        if index == 4:
+            assert result is None
+        else:
+            torch.testing.assert_close(result, tokenizer.eager(wav), rtol=0, atol=0)
+    calls.clear()
+    graphs.encode([torch.ones(2, 17)])
+    assert calls == [(1, 256)]
+    calls.clear()
+    assert graphs.encode([]) == [] and not calls
+
+
+def test_reference_aclgraph_frame_rounded_capture_limit(graph_runtime):
+    tokenizer = _Tokenizer()
+    tokenizer.sampling_rate = 67
+    tokenizer.downsample_rate = 10
+    graphs = backend.MossNPUReferenceEncoderGraphs(tokenizer, n_vq=N_VQ)
+    # Neither four nor eight seconds is frame-aligned for this geometry.
+    assert graphs._shapes == [(1, 270), (1, 540), (2, 270)]

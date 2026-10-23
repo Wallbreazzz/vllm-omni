@@ -5,19 +5,19 @@
 from __future__ import annotations
 
 import contextlib
-import math
 import os
 from collections.abc import Iterator
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.moss_tts.reference_encoder_graphs import MossReferenceEncoderGraphs
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 logger = init_logger(__name__)
 
 
-class MossNPUReferenceEncoderGraphs:
+class MossNPUReferenceEncoderGraphs(MossReferenceEncoderGraphs):
     """Retain true clip lengths while padding to a small, fixed graph set.
 
     The upstream tokenizer's SDPA attention is retained; the CUDA windowed
@@ -26,15 +26,15 @@ class MossNPUReferenceEncoderGraphs:
     """
 
     def __init__(self, tokenizer: torch.nn.Module, *, n_vq: int) -> None:
-        self._tokenizer = tokenizer
-        self._n_vq = n_vq
-        self._device = next(tokenizer.parameters()).device
-        frame = int(tokenizer.downsample_rate)
-        rate = int(tokenizer.sampling_rate)
-        # At most three graphs: (1, 4s), (1, 8s), (2, 4s), rounded to frames.
-        # This cap also applies when the existing fine CUDA bucket switches are set.
-        buckets = sorted({math.ceil(seconds * rate / frame) * frame for seconds in (4, 8)})
-        self._shapes = [(batch, samples) for batch in (1, 2) for samples in buckets if batch * samples <= buckets[-1]]
+        super().__init__(tokenizer, n_vq=n_vq, batch_sizes=(1, 2), bucket_seconds=(4, 8), max_batch_seconds=8)
+        # Bound padded shapes by the frame-rounded eight-second bucket.
+        self._max_batch_samples = self._buckets[-1]
+        self._shapes = [
+            (batch, samples)
+            for batch in self._batch_sizes
+            for samples in self._buckets
+            if batch * samples <= self._max_batch_samples
+        ]
         self._buffers: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self._runner = NPUExactGraphRunner(
             max_graphs=len(self._shapes),
@@ -73,17 +73,11 @@ class MossNPUReferenceEncoderGraphs:
                     current.wait_stream(self._stream)
 
     def _core(self, audio: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        tokenizer = self._tokenizer
-        dtype = getattr(tokenizer, "compute_dtype", None)
-        # Match eager encoding's outer NPU autocast, including its quantizer policy.
+        dtype = getattr(self._tokenizer, "compute_dtype", None)
+        # Match eager's outer autocast, including the quantizer, around the shared core.
         amp = torch.autocast(device_type="npu", dtype=dtype) if dtype in (torch.float16, torch.bfloat16) else None
         with amp if amp is not None else contextlib.nullcontext():
-            hidden, hidden_lengths = tokenizer._flatten_channels_for_codec(audio, lengths)
-            with tokenizer._codec_inference_autocast():
-                for module in tokenizer.encoder:
-                    hidden, hidden_lengths = module(hidden, hidden_lengths)
-            _, codes, code_lengths = tokenizer.quantizer(hidden.float(), hidden_lengths, self._n_vq)
-        return codes, code_lengths
+            return super()._core(audio, lengths)
 
     def _run(
         self, inputs: tuple[torch.Tensor, torch.Tensor], shape: tuple[int, int]
@@ -120,39 +114,24 @@ class MossNPUReferenceEncoderGraphs:
 
     def encode(self, wavs: list[torch.Tensor]) -> list[torch.Tensor | None]:
         self._check_healthy()
+        # Invalid clips remain the eager processor's responsibility.
+        indices = [
+            i for i, wav in enumerate(wavs) if wav.ndim == 2 and wav.shape[0] == self._channels and wav.shape[-1] > 0
+        ]
         out: list[torch.Tensor | None] = [None] * len(wavs)
-        # Invalid or unsupported clips remain the eager processor's responsibility.
-        order = sorted(
-            (
-                i
-                for i, wav in enumerate(wavs)
-                if wav.ndim == 2 and wav.shape[0] == self._tokenizer.number_channels and wav.shape[-1] > 0
-            ),
-            key=lambda i: -wavs[i].shape[-1],
-        )
         with self._context():
-            pos = 0
-            while pos < len(order):
-                longest = wavs[order[pos]].shape[-1]
-                samples = next((s for b, s in sorted(self._buffers) if b == 1 and s >= longest), None)
-                if samples is None:
-                    pos += 1
-                    continue
-                batch = max(b for b, s in self._buffers if s == samples)
-                rows = order[pos : pos + batch]
-                # Prefer the smallest available batch that fits the selected rows.
-                batch = min(b for b, s in self._buffers if s == samples and b >= len(rows))
-                audio, lengths = self._buffers[(batch, samples)]
-                audio.zero_()
-                true_lengths = [wavs[i].shape[-1] for i in rows] + [samples] * (batch - len(rows))
-                lengths.copy_(torch.tensor(true_lengths, dtype=torch.long))
-                for row, index in enumerate(rows):
-                    audio[row, :, : wavs[index].shape[-1]].copy_(wavs[index])
-                codes, code_lengths = self._run((audio, lengths), (batch, samples))
-                codes = codes[:, : len(rows)].cpu()
-                code_lengths = code_lengths[: len(rows)].cpu().tolist()
-                for row, index in enumerate(rows):
-                    # Own the returned CPU storage even for a one-frame clip.
-                    out[index] = codes[:, row, : int(code_lengths[row])].transpose(0, 1).long().contiguous()
-                pos += len(rows)
+            for index, codes in zip(indices, super().encode([wavs[i] for i in indices]), strict=True):
+                out[index] = codes
         return out
+
+    def _replay_bucket(self, batch: int, samples: int, wavs: list[torch.Tensor]) -> list[torch.Tensor]:
+        audio, lengths = self._buffers[(batch, samples)]
+        audio.zero_()
+        true_lengths = [wav.shape[-1] for wav in wavs] + [samples] * (batch - len(wavs))
+        lengths.copy_(torch.tensor(true_lengths, dtype=torch.long))
+        for row, wav in enumerate(wavs):
+            audio[row, :, : wav.shape[-1]].copy_(wav)
+        codes, code_lengths = self._run((audio, lengths), (batch, samples))
+        codes = codes[:, : len(wavs)].cpu()
+        code_lengths = code_lengths[: len(wavs)].cpu().tolist()
+        return [codes[:, row, : int(code_lengths[row])].transpose(0, 1).long().contiguous() for row in range(len(wavs))]
