@@ -33,7 +33,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -55,6 +55,9 @@ from vllm_omni.model_executor.models.moss_tts.shared_reference_encoder import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.platforms.npu.models.moss_tts_reference_encoder_graphs import MossNPUReferenceEncoderGraphs
 
 # Coalescing defaults. Kept as module constants (not env/CLI) to match the
 # ``_REF_AUDIO_RESOLVE_CACHE_MAX_*`` convention in serving_speech.py.
@@ -356,6 +359,7 @@ class MossReferenceEncoder:
         server_dir: str | None = None,
     ):
         self._processor = processor
+        self._variant = variant
         self._n_vq = int(n_vq)
         self._sr_target = int(sr_target)
         self._speaker_cache = speaker_cache
@@ -380,7 +384,7 @@ class MossReferenceEncoder:
         self._local_lock = threading.Lock()
         self._shared_host: SharedReferenceEncoderHost | None = None
         self._shared_client: SharedReferenceEncoderClient | None = None
-        self._graphs: MossReferenceEncoderGraphs | None = None
+        self._graphs: MossReferenceEncoderGraphs | MossNPUReferenceEncoderGraphs | None = None
         self._attention_installed = False
         self._graphs_enabled = reference_graphs_enabled()
         if window_ms is None:
@@ -628,7 +632,7 @@ class MossReferenceEncoder:
         return results
 
     def prepare(self) -> None:
-        """Capture the CUDA graphs (or start the shared encoder) before the first request."""
+        """Capture reference graphs (or start the shared encoder) before the first request."""
         role = shared_encoder_role(self._shared_codes_dir) if self._shares_encoder else ""
         if role == "host":
             self._host().wait_until_ready()
@@ -704,7 +708,11 @@ class MossReferenceEncoder:
             workers.append(((lambda wavs, g=graphs: self._encode_local(wavs, g)), graphs.capture))
         return workers
 
-    def _encode_local(self, prepared: list[torch.Tensor], graphs: MossReferenceEncoderGraphs | None = None) -> list:
+    def _encode_local(
+        self,
+        prepared: list[torch.Tensor],
+        graphs: MossReferenceEncoderGraphs | MossNPUReferenceEncoderGraphs | None = None,
+    ) -> list:
         """One batched forward, retried per clip so one bad clip fails alone."""
         try:
             return list(self._encode_prepared(prepared, graphs))
@@ -726,7 +734,9 @@ class MossReferenceEncoder:
             self._processor.audio_tokenizer = tokenizer.to(device)
 
     def _encode_prepared(
-        self, prepared: list[torch.Tensor], graphs: MossReferenceEncoderGraphs | None = None
+        self,
+        prepared: list[torch.Tensor],
+        graphs: MossReferenceEncoderGraphs | MossNPUReferenceEncoderGraphs | None = None,
     ) -> list[torch.Tensor]:
         # ``prepared`` clips come from _encoder_input, at ``_clip_rate()``.
         graphs = graphs or self._reference_graphs()
@@ -760,6 +770,17 @@ class MossReferenceEncoder:
             return False
         tokenizer = getattr(self._processor, "audio_tokenizer", None)
         device = next(tokenizer.parameters()).device if tokenizer is not None else None
+        if device is not None and device.type == "npu":
+            from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+            # Shared-host workers can replay concurrently in one API process.
+            # Keep that path eager until independent graph-pool ownership is validated.
+            shared = self._shares_encoder and os.environ.get(_SHARED_ENCODER_ENV, "1") != "0"
+            if self._variant != "local" or shared or not NPUExactGraphRunner.is_supported():
+                logger.warning("MOSS reference ACLGraph unavailable for this configuration; keeping NPU eager")
+                self._graphs_enabled = False
+                return False
+            return hasattr(tokenizer, "_codec_inference_autocast")
         if device is None or device.type != "cuda" or not hasattr(tokenizer, "_codec_inference_autocast"):
             self._graphs_enabled = False
             return False
@@ -789,11 +810,21 @@ class MossReferenceEncoder:
             raise ValueError("MOSS reference singleton bucket step must be 80..1000 ms, or 0 to disable")
         return tuple(ms / 1000 for ms in range(3000, 10001, step_ms))
 
-    def _reference_graphs(self) -> MossReferenceEncoderGraphs | None:
+    def _reference_graphs(self) -> MossReferenceEncoderGraphs | MossNPUReferenceEncoderGraphs | None:
         """Capture on first use, on the encode worker thread that replays them."""
         if self._graphs is None:
             if not self._graph_capable():
                 return None
+            if next(self._processor.audio_tokenizer.parameters()).device.type == "npu":
+                from vllm_omni.platforms.npu.models.moss_tts_reference_encoder_graphs import (
+                    MossNPUReferenceEncoderGraphs,
+                )
+
+                # Retain a failed runner so a later request cannot attempt another
+                # capture in a process whose allocator state may be invalid.
+                self._graphs = MossNPUReferenceEncoderGraphs(self._processor.audio_tokenizer, n_vq=self._n_vq)
+                self._graphs.capture()
+                return self._graphs
             graphs = MossReferenceEncoderGraphs(
                 self._processor.audio_tokenizer,
                 n_vq=self._n_vq,
