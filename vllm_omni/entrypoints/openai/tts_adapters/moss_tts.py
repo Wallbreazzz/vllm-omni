@@ -301,8 +301,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         from vllm_omni.platforms import current_omni_platform
 
         platform = current_omni_platform
-        if not (platform.is_cuda() or platform.is_rocm() or platform.is_npu()):
-            return torch.device("cpu")
         if platform.is_npu() and self._moss_variant != "local":
             return torch.device("cpu")
         devices_str = self._codec_stage_devices()
