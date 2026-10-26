@@ -745,13 +745,17 @@ class MossReferenceEncoder:
         param = next(tokenizer.parameters(), None) if isinstance(tokenizer, torch.nn.Module) else None
         with contextlib.ExitStack() as stack:
             stack.enter_context(torch.no_grad())
-            if param is not None and param.device.type == "npu":
+            if param is not None and param.device.type != "cpu":
+                device = param.device
                 # Both asyncio's pool and the shared host encode on fresh threads.
-                stack.enter_context(torch.get_device_module("npu").device(param.device))
+                stack.enter_context(torch.get_device_module(device.type).device(device))
                 dtype = getattr(tokenizer, "compute_dtype", None)
                 if dtype in (torch.float16, torch.bfloat16):
-                    # The upstream tokenizer only supplies CPU/CUDA autocast.
-                    stack.enter_context(torch.autocast(device_type="npu", dtype=dtype))
+                    from vllm_omni.platforms import current_omni_platform
+
+                    stack.enter_context(
+                        current_omni_platform.create_autocast_context(device_type=device.type, dtype=dtype)
+                    )
             return self._processor.encode_audios_from_wav(prepared, sampling_rate=self._clip_rate(), n_vq=self._n_vq)
 
     def _graph_capable(self) -> bool:
