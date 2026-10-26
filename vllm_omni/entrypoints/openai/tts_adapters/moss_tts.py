@@ -292,8 +292,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         and sees it as logical index 0, while replica launch restores the
         parent environment, so the same index names the same physical device in
         this process. When the stage pins no devices the stage worker and the
-        encoder both default to the first visible device. CUDA and ROCm retain
-        family-wide placement; NPU placement is enabled for Local only.
+        encoder both default to the first visible device. Device enumeration
+        and construction use the platform interface for every variant.
         Unavailable or unparsable stage devices fall back to CPU.
         """
         import torch  # local to avoid pulling torch at module import time
@@ -301,8 +301,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         from vllm_omni.platforms import current_omni_platform
 
         platform = current_omni_platform
-        if platform.is_npu() and self._moss_variant != "local":
-            return torch.device("cpu")
         devices_str = self._codec_stage_devices()
         first = devices_str.split(",")[0].strip() if devices_str is not None else ""
         if first == "cpu":
