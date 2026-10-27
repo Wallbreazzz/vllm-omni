@@ -7,7 +7,7 @@ import asyncio
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
@@ -22,19 +22,21 @@ from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
     build_reference_encoder,
     encode_request_references,
 )
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, None])
+@pytest.mark.parametrize("device_type", ["npu", "cuda", "xpu", "musa"])
 @pytest.mark.parametrize("shared_worker", [False, True])
 @pytest.mark.parametrize("fails", [False, True])
-async def test_npu_eager_encoding_uses_tokenizer_device_and_compute_dtype(
-    make_encoder, monkeypatch, dtype, shared_worker, fails
+async def test_accelerator_eager_encoding_uses_tokenizer_device_and_compute_dtype(
+    make_encoder, monkeypatch, dtype, device_type, shared_worker, fails
 ):
     state = {"device": None, "dtype": None}
-    device = SimpleNamespace(type="npu", index=3)
+    device = SimpleNamespace(type=device_type, index=3)
 
     class Tokenizer(torch.nn.Module):
         compute_dtype = dtype
@@ -52,8 +54,8 @@ async def test_npu_eager_encoding_uses_tokenizer_device_and_compute_dtype(
             state["device"] = None
 
     @contextmanager
-    def autocast(*, device_type, dtype):
-        assert device_type == "npu"
+    def autocast(*, device_type: str, dtype):
+        assert device_type == device.type
         assert state["device"] is device
         state["dtype"] = dtype
         try:
@@ -64,7 +66,7 @@ async def test_npu_eager_encoding_uses_tokenizer_device_and_compute_dtype(
     proc = _FakeProcessor()
     if fails:
         proc.set_fail_values({1})
-    proc.audio_tokenizer = Tokenizer()
+    monkeypatch.setattr(proc, "audio_tokenizer", Tokenizer(), raising=False)
     original = proc.encode_audios_from_wav
 
     def encode(wavs, sampling_rate, n_vq):
@@ -73,10 +75,16 @@ async def test_npu_eager_encoding_uses_tokenizer_device_and_compute_dtype(
         assert not torch.is_grad_enabled()
         return original(wavs, sampling_rate, n_vq)
 
-    proc.encode_audios_from_wav = encode
-    monkeypatch.setattr(torch, "get_device_module", lambda name: SimpleNamespace(device=device_context))
-    monkeypatch.setattr(torch, "autocast", autocast)
+    monkeypatch.setattr(proc, "encode_audios_from_wav", encode)
+
+    def get_device_module(name):
+        assert name == device.type
+        return SimpleNamespace(device=device_context)
+
+    monkeypatch.setattr(torch, "get_device_module", get_device_module)
+    monkeypatch.setattr(current_omni_platform, "create_autocast_context", autocast)
     enc = make_encoder(proc)
+    monkeypatch.setattr(enc, "_local_stream_context", nullcontext)
     if shared_worker:
         # Shared host workers call this callback without the local stream wrapper.
         monkeypatch.setattr(enc, "_graph_capable", lambda: False)
@@ -95,14 +103,16 @@ async def test_npu_eager_encoding_uses_tokenizer_device_and_compute_dtype(
 
 async def test_cpu_reference_encoder_does_not_add_autocast(make_encoder, monkeypatch):
     proc = _FakeProcessor()
-    proc.audio_tokenizer = torch.nn.Linear(1, 1)
-    proc.audio_tokenizer.compute_dtype = torch.bfloat16
+    tokenizer = torch.nn.Linear(1, 1)
+    monkeypatch.setattr(tokenizer, "compute_dtype", torch.bfloat16, raising=False)
+    monkeypatch.setattr(proc, "audio_tokenizer", tokenizer, raising=False)
 
     def unexpected(*args, **kwargs):
         raise AssertionError("CPU encoding must retain the processor's own precision policy")
 
     monkeypatch.setattr(torch, "autocast", unexpected)
     monkeypatch.setattr(torch, "get_device_module", unexpected)
+    monkeypatch.setattr(current_omni_platform, "create_autocast_context", unexpected)
     result = make_encoder(proc)._encode_prepared([torch.ones(1, 10)])
     assert result[0].dtype == torch.long
 
